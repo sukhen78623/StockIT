@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>StockIt - Free Indian Stock Research</title>
+<meta name="description" content="Free Indian stock research: NSE end-of-day prices, top gainers, losers and most active stocks.">
+<link rel="stylesheet" href="/assets/theme.css">
+<script src="/assets/shared.js"></script>
+</head>
+<body data-page="dashboard">
+<div id="page">
+  <div class="page-head">
+    <h1>Market Dashboard</h1>
+    <span class="badge" id="asof">Loading...</span>
+  </div>
+
+  <div class="grid g3" style="margin-bottom:14px">
+    <div class="card"><h2>NIFTY 50</h2><div class="na">Data Unavailable</div></div>
+    <div class="card"><h2>SENSEX</h2><div class="na">Data Unavailable</div></div>
+    <div class="card"><h2>Market breadth</h2><div class="na">Data Unavailable</div></div>
+  </div>
+
+  <div class="grid g3">
+    <div class="card"><h2>Top Gainers</h2><div class="tw" id="gainers"><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div></div></div>
+    <div class="card"><h2>Top Losers</h2><div class="tw" id="losers"><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div></div></div>
+    <div class="card"><h2>Most Active (by value)</h2><div class="tw" id="active"><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div></div></div>
+  </div>
+  <p class="note" id="rule">Source: NSE Bhavcopy, End of Day. Lists use NSE EQ-series stocks with traded value of at least 1 crore on the latest loaded day.</p>
+</div>
+
+<script>
+StockIt.ready(function () {
+  var S = StockIt, $ = function (i) { return document.getElementById(i); };
+
+  function table(rows, withValue) {
+    if (!rows || !rows.length) return S.na('Data Unavailable');
+    var h = '<table class="tbl"><thead><tr><th>Stock</th><th>Price</th><th>Chg %</th>' + (withValue ? '<th>Value (Cr)</th>' : '') + '</tr></thead><tbody>';
+    rows.forEach(function (r) {
+      var cls = r.pct > 0 ? 'up' : (r.pct < 0 ? 'down' : '');
+      h += '<tr class="row" data-s="' + S.esc(r.symbol) + '"><td><span class="sym">' + S.esc(r.symbol) + '</span><span class="nm">' + S.esc(r.name || '') + '</span></td>' +
+           '<td>' + S.fmt(r.close) + '</td><td class="' + cls + '">' + S.pct(r.pct) + '</td>' +
+           (withValue ? '<td>' + S.fmt(r.turnover_cr) + '</td>' : '') + '</tr>';
+    });
+    return h + '</tbody></table>';
+  }
+
+  function fail() {
+    $('asof').textContent = 'Data Unavailable';
+    ['gainers', 'losers', 'active'].forEach(function (id) { $(id).innerHTML = S.na('Data Unavailable'); });
+  }
+
+  document.addEventListener('click', function (e) {
+    var tr = e.target.closest ? e.target.closest('tr.row') : null;
+    if (tr) location.href = '/stock?symbol=' + encodeURIComponent(tr.getAttribute('data-s'));
+  });
+
+  fetch(S.api + '/api/market')
+    .then(function (r) { if (!r.ok) throw 0; return r.json(); })
+    .then(function (m) {
+      if (!m.date) { fail(); return; }
+      $('asof').textContent = 'End of Day \u00B7 ' + m.date;
+      $('gainers').innerHTML = table(m.gainers, false);
+      $('losers').innerHTML = table(m.losers, false);
+      $('active').innerHTML = table(m.active, true);
+    })
+    .catch(fail);
+});
+</script>
+</body>
+</html>
