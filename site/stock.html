@@ -3,96 +3,150 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>StockIt - Free Stock Research Tool for Indian Investors</title>
-<meta name="description" content="Free stock research tool for Indian investors: NSE end-of-day prices, charts and market movers.">
+<title>Stock - StockIt</title>
 <link rel="stylesheet" href="/assets/theme.css">
 <script src="/assets/shared.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
-<body data-page="home">
+<body data-page="stock">
 <div id="page">
-
-  <section class="hero">
-    <h1>Free Stock Research Tool for Indian Investors</h1>
-    <p class="muted">NSE prices, charts and market movers in one clean place.</p>
-    <div class="gsearch hero-search" data-search></div>
-    <div class="chips">
-      <span class="muted">Or analyse:</span>
-      <a class="chip" href="/stock?symbol=RELIANCE">Reliance</a>
-      <a class="chip" href="/stock?symbol=TCS">TCS</a>
-      <a class="chip" href="/stock?symbol=HDFCBANK">HDFC Bank</a>
-      <a class="chip" href="/stock?symbol=INFY">Infosys</a>
-      <a class="chip" href="/stock?symbol=ICICIBANK">ICICI Bank</a>
-      <a class="chip" href="/stock?symbol=SBIN">SBI</a>
-      <a class="chip" href="/stock?symbol=ITC">ITC</a>
-      <a class="chip" href="/stock?symbol=LT">L&amp;T</a>
+  <div id="hd" class="page-head" style="align-items:flex-start">
+    <div>
+      <h1 id="name">Loading...</h1>
+      <div class="muted" style="margin-top:4px"><span id="sym"></span> · NSE · <span class="badge">End of Day</span> <span id="asof"></span></div>
     </div>
-  </section>
+    <div style="text-align:right"><div class="price" id="price">—</div><div id="chg" class="muted">—</div></div>
+  </div>
 
-  <section class="card" style="margin-top:34px">
-    <div class="bar-row">
-      <h2 style="margin:0">Market movers</h2>
-      <span class="badge" id="asof">Loading...</span>
+  <div class="card" id="chartCard">
+    <div class="page-head" style="margin-bottom:10px">
+      <h2 style="margin:0">Price chart</h2>
+      <div class="seg" id="rng">
+        <button data-d="30">1M</button><button data-d="180">6M</button><button data-d="365" class="on">1Y</button><button data-d="1830">5Y</button>
+      </div>
     </div>
-    <div class="bar-row">
-      <div class="seg" id="idx"><button data-i="nifty50" class="on">NIFTY 50</button><button data-i="nifty500">NIFTY 500</button></div>
-      <div class="seg" id="tab"><button data-t="gainers" class="on">Gainers</button><button data-t="losers">Losers</button><button data-t="active">Most active</button></div>
-    </div>
-    <div class="tw" id="tbl"><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>
-    <p class="note">Official NSE closing prices of the date shown (End of Day). NSE's own website shows live prices while the market is open, so numbers can differ until the day's data is loaded after close.</p>
-  </section>
+    <div id="chart" style="height:380px"><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>
+    <p class="note" id="cnote">Daily candles from NSE End of Day data. Not live prices.</p>
+  </div>
 
+  <div class="card" style="margin-top:14px">
+    <h2>Key numbers</h2>
+    <div class="grid gs" id="stats"><div class="sk"></div></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card"><h2>Fundamentals</h2><div class="na">Data Unavailable</div></div>
+    <div class="card"><h2>Revenue &amp; Expenses</h2><div class="na">Data Unavailable</div></div>
+    <div class="card"><h2>Shareholding</h2><div class="na">Data Unavailable</div></div>
+    <div class="card"><h2>News &amp; Corporate Actions</h2><div class="na">Data Unavailable</div></div>
+  </div>
 </div>
 
 <script>
 StockIt.ready(function () {
   var S = StockIt, $ = function (i) { return document.getElementById(i); };
-  var state = { i: 'nifty50', t: 'gainers' }, cache = {};
+  var sym = (new URLSearchParams(location.search).get('symbol') || '').trim().toUpperCase();
 
-  function table(rows, withValue) {
-    if (!rows || !rows.length) return S.na('Data Unavailable');
-    var h = '<table class="tbl"><thead><tr><th>Stock</th><th>Price</th><th>Chg %</th>' + (withValue ? '<th>Value (Cr)</th>' : '') + '</tr></thead><tbody>';
-    rows.forEach(function (r) {
-      var cls = r.pct > 0 ? 'up' : (r.pct < 0 ? 'down' : '');
-      h += '<tr class="row" data-s="' + S.esc(r.symbol) + '"><td><span class="sym">' + S.esc(r.symbol) + '</span><span class="nm">' + S.esc(r.name || '') + '</span></td>' +
-           '<td>' + S.fmt(r.close) + '</td><td class="' + cls + '">' + S.pct(r.pct) + '</td>' +
-           (withValue ? '<td>' + S.fmt(r.turnover_cr) + '</td>' : '') + '</tr>';
-    });
-    return h + '</tbody></table>';
+  if (!sym) {
+    $('name').textContent = 'Stock';
+    $('sym').textContent = 'Use the search box above to open a stock.';
+    $('chartCard').style.display = 'none';
+    $('stats').parentNode.style.display = 'none';
+    return;
+  }
+  document.title = sym + ' - StockIt';
+  $('name').textContent = sym;
+  $('sym').textContent = sym;
+
+  fetch(S.api + '/api/search?q=' + encodeURIComponent(sym))
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      var m = (j.results || []).filter(function (x) { return x.symbol === sym; })[0];
+      if (m && m.name) $('name').textContent = m.name;
+    }).catch(function () {});
+
+  function cv(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  function unavailable(msg) {
+    $('chart').innerHTML = S.na(msg);
+    $('stats').innerHTML = S.na(msg);
+    $('price').textContent = '\u2014';
+    $('chg').textContent = 'Data Unavailable';
   }
 
-  function render() {
-    var m = cache[state.i];
-    if (!m || !m.date) { $('asof').textContent = 'Data Unavailable'; $('tbl').innerHTML = S.na('Data Unavailable'); return; }
-    $('asof').textContent = 'End of Day \u00B7 ' + m.date;
-    $('tbl').innerHTML = table(m[state.t], state.t === 'active');
-  }
+  fetch(S.api + '/api/prices?symbol=' + encodeURIComponent(sym) + '&days=1900')
+    .then(function (r) { if (!r.ok) throw 0; return r.json(); })
+    .then(function (j) {
+      var all = (j.candles || []).filter(function (c) {
+        return c.open != null && c.high != null && c.low != null && c.close != null;
+      });
+      if (!all.length) { unavailable('Data Unavailable \u2014 no price data loaded for this stock.'); return; }
+      var last = all[all.length - 1];
+      $('cnote').textContent = 'Daily candles from NSE End of Day data (raw prices, not adjusted for splits or bonus issues). History available from ' + all[0].time + '. Not live prices.';
 
-  function load() {
-    if (cache[state.i]) { render(); return; }
-    $('tbl').innerHTML = '<div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk"></div>';
-    fetch(S.api + '/api/market?index=' + state.i)
-      .then(function (r) { if (!r.ok) throw 0; return r.json(); })
-      .then(function (m) { cache[state.i] = m; render(); })
-      .catch(function () { cache[state.i] = null; render(); });
-  }
+      // Header
+      $('price').textContent = S.fmt(last.close);
+      $('asof').textContent = last.time;
+      var ch = last.prev_close ? ((last.close - last.prev_close) / last.prev_close * 100) : null;
+      var chAbs = last.prev_close ? (last.close - last.prev_close) : null;
+      $('chg').className = ch > 0 ? 'up' : (ch < 0 ? 'down' : 'muted');
+      $('chg').textContent = ch == null ? 'Data Unavailable' : ((chAbs > 0 ? '+' : '') + S.fmt(chAbs) + '  (' + S.pct(ch) + ')');
 
-  function seg(id, attr, key) {
-    $(id).addEventListener('click', function (e) {
-      var b = e.target.closest('button'); if (!b) return;
-      state[key] = b.getAttribute(attr);
-      Array.prototype.forEach.call($(id).children, function (x) { x.classList.toggle('on', x === b); });
-      load();
-    });
-  }
-  seg('idx', 'data-i', 'i');
-  seg('tab', 'data-t', 't');
+      // Stats
+      var cut1 = new Date(new Date(last.time + 'T00:00:00Z').getTime() - 365 * 86400000).toISOString().slice(0, 10);
+      var yr = all.filter(function (c) { return c.time >= cut1; });
+      var hi = Math.max.apply(null, yr.map(function (c) { return c.high; }));
+      var lo = Math.min.apply(null, yr.map(function (c) { return c.low; }));
+      var enough = yr.length >= 240;
+      var cells = [
+        ['Open', S.fmt(last.open)], ['High', S.fmt(last.high)], ['Low', S.fmt(last.low)], ['Close', S.fmt(last.close)],
+        ['Prev close', S.fmt(last.prev_close)],
+        ['Volume', last.volume == null ? '\u2014' : Number(last.volume).toLocaleString('en-IN')],
+        ['52W high', enough ? S.fmt(hi) : 'Data Unavailable'],
+        ['52W low', enough ? S.fmt(lo) : 'Data Unavailable']
+      ];
+      $('stats').innerHTML = cells.map(function (c) { return '<div class="stat"><span>' + c[0] + '</span><b>' + c[1] + '</b></div>'; }).join('');
 
-  document.addEventListener('click', function (e) {
-    var tr = e.target.closest ? e.target.closest('tr.row') : null;
-    if (tr) location.href = '/stock?symbol=' + encodeURIComponent(tr.getAttribute('data-s'));
-  });
+      // Chart
+      if (!window.LightweightCharts) { $('chart').innerHTML = S.na('Chart Unavailable'); return; }
+      var el = $('chart'); el.innerHTML = '';
+      var chart = LightweightCharts.createChart(el, {
+        width: el.clientWidth, height: 380,
+        layout: { background: { type: 'solid', color: cv('--surface') }, textColor: cv('--muted') },
+        grid: { vertLines: { color: cv('--border') }, horzLines: { color: cv('--border') } },
+        rightPriceScale: { borderColor: cv('--border') },
+        timeScale: { borderColor: cv('--border') }
+      });
+      var cs = chart.addCandlestickSeries({ borderVisible: false });
+      var vs = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: '' });
+      vs.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+      var days = 365;
 
-  load();
+      function draw() {
+        var up = cv('--up'), down = cv('--down');
+        chart.applyOptions({
+          layout: { background: { type: 'solid', color: cv('--surface') }, textColor: cv('--muted') },
+          grid: { vertLines: { color: cv('--border') }, horzLines: { color: cv('--border') } },
+          rightPriceScale: { borderColor: cv('--border') }, timeScale: { borderColor: cv('--border') }
+        });
+        cs.applyOptions({ upColor: up, downColor: down, wickUpColor: up, wickDownColor: down });
+        var cut = new Date(new Date(last.time + 'T00:00:00Z').getTime() - days * 86400000).toISOString().slice(0, 10);
+        var part = all.filter(function (c) { return c.time >= cut; });
+        cs.setData(part.map(function (c) { return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }; }));
+        vs.setData(part.map(function (c) { return { time: c.time, value: c.volume || 0, color: (c.close >= c.open ? up : down) + '66' }; }));
+        chart.timeScale().fitContent();
+      }
+      draw();
+      window.addEventListener('themechange', draw);
+      if (window.ResizeObserver) new ResizeObserver(function () { chart.applyOptions({ width: el.clientWidth }); }).observe(el);
+
+      $('rng').addEventListener('click', function (e) {
+        var b = e.target.closest('button'); if (!b) return;
+        days = parseInt(b.getAttribute('data-d'), 10);
+        Array.prototype.forEach.call($('rng').children, function (x) { x.classList.toggle('on', x === b); });
+        draw();
+      });
+    })
+    .catch(function () { unavailable('Data Unavailable'); });
 });
 </script>
 </body>
