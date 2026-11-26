@@ -168,6 +168,62 @@ async function logFailure(env, name, message) {
   } catch (e) {}
 }
 
+// ---------- Admin page (/admin): one-click history loader for phone ----------
+const ADMIN_HTML = String.raw`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StockIt Admin</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0b1220;color:#e6edf3;padding:16px;max-width:600px;margin:auto}
+input,button{width:100%;padding:12px;margin:6px 0;font-size:16px;border-radius:8px;border:1px solid #334;background:#111a2e;color:#e6edf3;box-sizing:border-box}
+button{background:#10b981;color:#04130d;font-weight:700;border:0}
+pre{white-space:pre-wrap;background:#111a2e;padding:10px;border-radius:8px;font-size:13px}
+</style></head><body>
+<h2>StockIt Admin</h2>
+<label>Admin key</label><input id="k" type="password">
+<label>From date</label><input id="f" type="date">
+<label>To date</label><input id="t" type="date">
+<button id="go">Load price history</button>
+<button id="names" style="background:#3b82f6;color:#fff">Load company names</button>
+<pre id="log">Ready.</pre>
+<script>
+var $=function(i){return document.getElementById(i)};
+function addDays(s,n){var d=new Date(s+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10)}
+var now=new Date();
+$('t').value=now.toISOString().slice(0,10);
+$('f').value=new Date(now.getTime()-365*86400000).toISOString().slice(0,10);
+function log(m){$('log').textContent+='\n'+m}
+var running=false;
+$('go').onclick=async function(){
+  if(running)return; running=true;
+  var key=$('k').value.trim(),cur=$('f').value,end=$('t').value;
+  if(!key||!cur||!end){log('Key and both dates are needed');running=false;return}
+  var loaded=0,skipped=0,errors=0;
+  while(cur<=end){
+    var ce=addDays(cur,4); if(ce>end)ce=end;
+    try{
+      var r=await fetch('/api/load?key='+encodeURIComponent(key)+'&date='+cur+'&to='+ce);
+      var j=await r.json();
+      if(j.error){log('Stopped at '+cur+': '+j.error);break}
+      j.results.forEach(function(x){
+        if(x.status==='loaded')loaded++;
+        else if(x.status==='error'){errors++; if(errors<=3)log('Problem '+x.date+': '+x.message)}
+        else skipped++;
+      });
+      log(cur+' to '+ce+' done. Trading days loaded so far: '+loaded);
+    }catch(e){log('Network error: '+e.message);break}
+    cur=addDays(ce,1);
+  }
+  log('Finished. Loaded '+loaded+' days, skipped '+skipped+' (weekends/holidays), problems '+errors+'.');
+  running=false;
+};
+$('names').onclick=async function(){
+  var key=$('k').value.trim();
+  if(!key){log('Admin key needed');return}
+  try{var r=await fetch('/api/load-names?key='+encodeURIComponent(key));log(await r.text())}
+  catch(e){log('Network error: '+e.message)}
+};
+</script></body></html>`;
+
 // ---------- Worker ----------
 export default {
   async fetch(request, env) {
@@ -226,6 +282,11 @@ export default {
           });
         }
 
+        case '/admin':
+          return new Response(ADMIN_HTML, {
+            headers: { 'Content-Type': 'text/html; charset=utf-8' },
+          });
+
         case '/api/load': {
           if (!isAdmin) return json({ error: 'forbidden' }, 403);
           const from = q.get('date') || istToday();
@@ -233,7 +294,11 @@ export default {
           const results = [];
           let d = from;
           for (let i = 0; i < 5 && d <= to; i++) {
-            results.push(await loadDay(env, d));
+            try {
+              results.push(await loadDay(env, d));
+            } catch (e) {
+              results.push({ date: d, status: 'error', message: String(e.message || e) });
+            }
             d = addDays(d, 1);
           }
           return json({ results, note: 'max 5 days per call' });
