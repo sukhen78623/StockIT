@@ -125,12 +125,39 @@ from raw r
 where i.exchange = 'NSE' and i.symbol = trim(r.f[1])`;
 
 // ---------- Loaders ----------
-async function loadDay(env, iso) {
+// NSE sometimes drops a request, so try up to 3 times before giving up.
+async function fetchNse(url) {
+  let last = null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await fetch(url, { headers: NSE_HEADERS });
+      if (res.status === 404) return res;
+      if (res.ok) return res;
+      last = new Error('NSE returned HTTP ' + res.status);
+    } catch (e) {
+      last = e;
+    }
+    await new Promise((r) => setTimeout(r, 700 * (i + 1)));
+  }
+  throw last || new Error('NSE request failed');
+}
+
+async function loadDay(env, iso, force = false) {
   if (isWeekend(iso)) return { date: iso, status: 'skipped_weekend' };
+
+  // Already in the database? Skip (makes re-running the loader fast).
+  if (!force) {
+    const have = await sql(
+      env,
+      `select count(*)::int as n from price_daily where trade_date = $1::date`,
+      [iso]
+    );
+    if ((have.rows[0] && have.rows[0].n) >= 1000) return { date: iso, status: 'already_loaded' };
+  }
+
   const url = `https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_${ddmmyyyy(iso)}.csv`;
-  const res = await fetch(url, { headers: NSE_HEADERS });
+  const res = await fetchNse(url);
   if (res.status === 404) return { date: iso, status: 'no_file (holiday, or not published yet)' };
-  if (!res.ok) throw new Error(`NSE returned HTTP ${res.status} for ${iso}`);
   const csv = await res.text();
   const head = csv.slice(0, 400).toUpperCase();
   if (!head.includes('CLOSE_PRICE') || !head.includes('TURNOVER_LACS')) {
@@ -149,9 +176,7 @@ async function loadDay(env, iso) {
 }
 
 async function loadNames(env) {
-  const res = await fetch('https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv', {
-    headers: NSE_HEADERS,
-  });
+  const res = await fetchNse('https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv');
   if (!res.ok) throw new Error(`NSE returned HTTP ${res.status} for company list`);
   const csv = await res.text();
   const r = await sql(env, NAMES_SQL, [csv]);
@@ -169,6 +194,7 @@ async function logFailure(env, name, message) {
 }
 
 // ---------- Admin page (/admin): one-click history loader for phone ----------
+// One day per request, auto-retry, never stops on a problem day, safe to re-run.
 const ADMIN_HTML = String.raw`<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>StockIt Admin</title>
@@ -177,6 +203,9 @@ body{font-family:system-ui,sans-serif;background:#0b1220;color:#e6edf3;padding:1
 input,button{width:100%;padding:12px;margin:6px 0;font-size:16px;border-radius:8px;border:1px solid #334;background:#111a2e;color:#e6edf3;box-sizing:border-box}
 button{background:#10b981;color:#04130d;font-weight:700;border:0}
 pre{white-space:pre-wrap;background:#111a2e;padding:10px;border-radius:8px;font-size:13px}
+#st{font-weight:700;color:#10b981;margin:8px 0}
+.bar{height:10px;background:#1b2740;border-radius:6px;overflow:hidden}
+#pb{height:10px;width:0;background:#10b981}
 </style></head><body>
 <h2>StockIt Admin</h2>
 <label>Admin key</label><input id="k" type="password">
@@ -184,36 +213,61 @@ pre{white-space:pre-wrap;background:#111a2e;padding:10px;border-radius:8px;font-
 <label>To date</label><input id="t" type="date">
 <button id="go">Load price history</button>
 <button id="names" style="background:#3b82f6;color:#fff">Load company names</button>
-<pre id="log">Ready.</pre>
+<div id="st">Ready.</div>
+<div class="bar"><div id="pb"></div></div>
+<pre id="log">Screen on rakho jotokkhon load hocche. Beshi problem hole abar button tipo, agey load howa din skip hobe.</pre>
 <script>
 var $=function(i){return document.getElementById(i)};
 function addDays(s,n){var d=new Date(s+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10)}
+function isWeekend(s){var w=new Date(s+'T00:00:00Z').getUTCDay();return w===0||w===6}
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
 var now=new Date();
 $('t').value=now.toISOString().slice(0,10);
 $('f').value=new Date(now.getTime()-365*86400000).toISOString().slice(0,10);
-function log(m){$('log').textContent+='\n'+m}
-var running=false;
+try{var sk=localStorage.getItem('stockit_key');if(sk)$('k').value=sk}catch(e){}
+function log(m){var l=$('log');l.textContent+='\n'+m;l.scrollTop=l.scrollHeight}
+var running=false,wake=null;
+async function callDay(key,d){
+  var lastErr='';
+  for(var a=1;a<=3;a++){
+    try{
+      var ctl=new AbortController();
+      var tm=setTimeout(function(){ctl.abort()},60000);
+      var r=await fetch('/api/load?key='+encodeURIComponent(key)+'&date='+d+'&to='+d,{signal:ctl.signal});
+      clearTimeout(tm);
+      var j=await r.json();
+      if(j.error){return {status:'fatal',message:j.error}}
+      var x=j.results[0];
+      if(x.status==='error'){lastErr=x.message}else{return x}
+    }catch(e){lastErr='Network: '+e.message}
+    await sleep(3000*a);
+  }
+  return {status:'error',message:lastErr};
+}
 $('go').onclick=async function(){
   if(running)return; running=true;
   var key=$('k').value.trim(),cur=$('f').value,end=$('t').value;
   if(!key||!cur||!end){log('Key and both dates are needed');running=false;return}
-  var loaded=0,skipped=0,errors=0;
+  try{localStorage.setItem('stockit_key',key)}catch(e){}
+  try{if(navigator.wakeLock)wake=await navigator.wakeLock.request('screen')}catch(e){}
+  var total=0,t=cur;while(t<=end){if(!isWeekend(t))total++;t=addDays(t,1)}
+  var done=0,loaded=0,already=0,skipped=0,problems=[];
   while(cur<=end){
-    var ce=addDays(cur,4); if(ce>end)ce=end;
-    try{
-      var r=await fetch('/api/load?key='+encodeURIComponent(key)+'&date='+cur+'&to='+ce);
-      var j=await r.json();
-      if(j.error){log('Stopped at '+cur+': '+j.error);break}
-      j.results.forEach(function(x){
-        if(x.status==='loaded')loaded++;
-        else if(x.status==='error'){errors++; if(errors<=3)log('Problem '+x.date+': '+x.message)}
-        else skipped++;
-      });
-      log(cur+' to '+ce+' done. Trading days loaded so far: '+loaded);
-    }catch(e){log('Network error: '+e.message);break}
-    cur=addDays(ce,1);
+    if(isWeekend(cur)){cur=addDays(cur,1);continue}
+    var x=await callDay(key,cur);
+    if(x.status==='fatal'){log('Stopped at '+cur+': '+x.message);break}
+    if(x.status==='loaded')loaded++;
+    else if(x.status==='already_loaded')already++;
+    else if(x.status==='error'){problems.push(cur+': '+x.message);log('Problem '+cur+': '+x.message)}
+    else skipped++;
+    done++;
+    $('st').textContent=cur+' | '+done+'/'+total+' | loaded '+loaded+', already '+already+', holiday '+skipped+', problems '+problems.length;
+    $('pb').style.width=Math.round(done*100/Math.max(total,1))+'%';
+    cur=addDays(cur,1);
   }
-  log('Finished. Loaded '+loaded+' days, skipped '+skipped+' (weekends/holidays), problems '+errors+'.');
+  log('Finished. Loaded '+loaded+', already there '+already+', holidays '+skipped+', problems '+problems.length+'.');
+  if(problems.length){log('Problem din gulo:\n'+problems.join('\n')+'\nAbar button tipo, shudhu eigulo abar try hobe.')}
+  try{if(wake)wake.release()}catch(e){}
   running=false;
 };
 $('names').onclick=async function(){
@@ -317,11 +371,11 @@ export default {
     }
   },
 
-  // Daily automatic load (set the cron trigger in the dashboard)
+  // Daily automatic load (cron in wrangler.jsonc: 30 14 * * * = 8:00 PM IST)
   async scheduled(event, env, ctx) {
     const day = istToday();
     ctx.waitUntil(
-      loadDay(env, day).catch((e) => logFailure(env, 'nse_eod_' + day, e.message))
+      loadDay(env, day, true).catch((e) => logFailure(env, 'nse_eod_' + day, e.message))
     );
   },
 };
