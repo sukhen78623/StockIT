@@ -18,10 +18,10 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type',
 };
 
-function json(data, status = 200) {
+function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', ...CORS },
+    headers: { 'Content-Type': 'application/json', ...CORS, ...extra },
   });
 }
 
@@ -196,26 +196,21 @@ async function logFailure(env, name, message) {
 // ---------- Admin page (/admin): one-click history loader for phone ----------
 // One day per request, auto-retry, never stops on a problem day, safe to re-run.
 const ADMIN_HTML = String.raw`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>StockIt Admin</title>
-<style>
-body{font-family:system-ui,sans-serif;background:#0b1220;color:#e6edf3;padding:16px;max-width:600px;margin:auto}
-input,button{width:100%;padding:12px;margin:6px 0;font-size:16px;border-radius:8px;border:1px solid #334;background:#111a2e;color:#e6edf3;box-sizing:border-box}
-button{background:#10b981;color:#04130d;font-weight:700;border:0}
-pre{white-space:pre-wrap;background:#111a2e;padding:10px;border-radius:8px;font-size:13px}
-#st{font-weight:700;color:#10b981;margin:8px 0}
-.bar{height:10px;background:#1b2740;border-radius:6px;overflow:hidden}
-#pb{height:10px;width:0;background:#10b981}
-</style></head><body>
-<h2>StockIt Admin</h2>
-<label>Admin key</label><input id="k" type="password">
-<label>From date</label><input id="f" type="date">
-<label>To date</label><input id="t" type="date">
-<button id="go">Load price history</button>
-<button id="names" style="background:#3b82f6;color:#fff">Load company names</button>
-<div id="st">Ready.</div>
-<div class="bar"><div id="pb"></div></div>
-<pre id="log">Screen on rakho jotokkhon load hocche. Beshi problem hole abar button tipo, agey load howa din skip hobe.</pre>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>StockIt Admin</title>
+<link rel="stylesheet" href="/assets/theme.css"><script src="/assets/shared.js"></script></head>
+<body data-page="admin"><div id="page" class="narrow">
+<div class="page-head"><h1>Admin</h1></div>
+<div class="card">
+<label class="lb">Admin key</label><input class="input" id="k" type="password">
+<label class="lb">From date</label><input class="input" id="f" type="date">
+<label class="lb">To date</label><input class="input" id="t" type="date">
+<button class="btn primary" id="go">Load price history</button>
+<button class="btn" id="names">Load company names</button>
+</div>
+<p id="st" class="muted" style="margin:14px 0 6px">Ready.</p>
+<div class="progress"><div id="pb"></div></div>
+<pre class="log" id="log" style="margin-top:12px">Screen on rakho jotokkhon load hocche. Problem hole abar button tipo, agey load howa din skip hobe.</pre>
 <script>
 var $=function(i){return document.getElementById(i)};
 function addDays(s,n){var d=new Date(s+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10)}
@@ -266,7 +261,7 @@ $('go').onclick=async function(){
     cur=addDays(cur,1);
   }
   log('Finished. Loaded '+loaded+', already there '+already+', holidays '+skipped+', problems '+problems.length+'.');
-  if(problems.length){log('Problem din gulo:\n'+problems.join('\n')+'\nAbar button tipo, shudhu eigulo abar try hobe.')}
+  if(problems.length){log('Problem din gulo:\n'+problems.join('\n'))}
   try{if(wake)wake.release()}catch(e){}
   running=false;
 };
@@ -276,7 +271,7 @@ $('names').onclick=async function(){
   try{var r=await fetch('/api/load-names?key='+encodeURIComponent(key));log(await r.text())}
   catch(e){log('Network error: '+e.message)}
 };
-</script></body></html>`;
+</script></div></body></html>`;
 
 // ---------- Worker ----------
 export default {
@@ -320,7 +315,7 @@ export default {
           const r = await sql(
             env,
             `select p.trade_date::text as time, p.open::float8 as open, p.high::float8 as high,
-                    p.low::float8 as low, p.close::float8 as close, p.volume::float8 as volume
+                    p.low::float8 as low, p.close::float8 as close, p.prev_close::float8 as prev_close, p.volume::float8 as volume
              from price_daily p join instruments i on i.id = p.instrument_id
              where i.exchange = 'NSE' and i.symbol = $1::text
                and p.trade_date >= current_date - $2::int
@@ -334,6 +329,29 @@ export default {
             source: 'NSE Bhavcopy',
             candles: r.rows,
           });
+        }
+
+        case '/api/market': {
+          // Top gainers / losers / most active on the latest loaded day (real data only)
+          const base = `from price_daily p join instruments i on i.id = p.instrument_id
+            where p.trade_date = (select max(trade_date) from price_daily)
+              and i.series = 'EQ' and p.prev_close > 0 and p.close is not null
+              and p.turnover >= 10000000`;
+          const cols = `select i.symbol, i.name, p.close::float8 as close, p.prev_close::float8 as prev_close,
+            ((p.close - p.prev_close) / p.prev_close * 100)::float8 as pct,
+            p.volume::float8 as volume, (p.turnover / 10000000)::float8 as turnover_cr,
+            p.trade_date::text as date`;
+          const [g, l, a] = await Promise.all([
+            sql(env, `${cols} ${base} order by pct desc limit 10`),
+            sql(env, `${cols} ${base} order by pct asc limit 10`),
+            sql(env, `${cols} ${base} order by p.turnover desc limit 10`),
+          ]);
+          const date = (a.rows[0] || g.rows[0] || {}).date || null;
+          return json(
+            { date, data_status: 'End of Day', source: 'NSE Bhavcopy', gainers: g.rows, losers: l.rows, active: a.rows },
+            200,
+            { 'Cache-Control': 'public, max-age=300' }
+          );
         }
 
         case '/admin':
@@ -379,3 +397,4 @@ export default {
     );
   },
 };
+                
