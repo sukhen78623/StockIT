@@ -113,6 +113,13 @@ on conflict (instrument_id, trade_date) do update set
   volume = excluded.volume, turnover = excluded.turnover,
   retrieved_at = now()`;
 
+// Older history: store only NIFTY 500 stocks (keeps the free database small)
+const PRICES_SQL_500 = PRICES_SQL.replace(
+  "join instruments i on i.exchange = 'NSE' and i.symbol = p.sym",
+  "join instruments i on i.exchange = 'NSE' and i.symbol = p.sym join index_members m on m.index_name = 'nifty500' and m.symbol = p.sym"
+);
+if (PRICES_SQL_500 === PRICES_SQL) throw new Error('PRICES_SQL_500 patch failed');
+
 const NAMES_SQL = `
 with raw as (
   select regexp_split_to_array(line, ',(?=(?:[^"]*"[^"]*")*[^"]*$)') as f
@@ -142,7 +149,7 @@ async function fetchNse(url) {
   throw last || new Error('NSE request failed');
 }
 
-async function loadDay(env, iso, force = false) {
+async function loadDay(env, iso, force = false, only500 = false) {
   if (isWeekend(iso)) return { date: iso, status: 'skipped_weekend' };
 
   // Already in the database? Skip (makes re-running the loader fast).
@@ -152,7 +159,7 @@ async function loadDay(env, iso, force = false) {
       `select count(*)::int as n from price_daily where trade_date = $1::date`,
       [iso]
     );
-    if ((have.rows[0] && have.rows[0].n) >= 1000) return { date: iso, status: 'already_loaded' };
+    if ((have.rows[0] && have.rows[0].n) >= (only500 ? 300 : 1000)) return { date: iso, status: 'already_loaded' };
   }
 
   const url = `https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_${ddmmyyyy(iso)}.csv`;
@@ -164,7 +171,7 @@ async function loadDay(env, iso, force = false) {
     throw new Error('NSE file format looks changed. Loader needs an update.');
   }
   await sql(env, INSTRUMENTS_SQL, [csv]);
-  const r = await sql(env, PRICES_SQL, [csv]);
+  const r = await sql(env, only500 ? PRICES_SQL_500 : PRICES_SQL, [csv]);
   const rows = r.rowCount ?? 0;
   await sql(
     env,
@@ -181,6 +188,44 @@ async function loadNames(env) {
   const csv = await res.text();
   const r = await sql(env, NAMES_SQL, [csv]);
   return { status: 'names_updated', rows: r.rowCount ?? 0 };
+}
+
+// ---------- Index member lists (NIFTY 50 / NIFTY 500) ----------
+const INDEX_LISTS = {
+  nifty50: [
+    'https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv',
+    'https://archives.nseindia.com/content/indices/ind_nifty50list.csv',
+  ],
+  nifty500: [
+    'https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv',
+    'https://archives.nseindia.com/content/indices/ind_nifty500list.csv',
+  ],
+};
+
+async function loadIndex(env, name) {
+  let csv = null, last = null;
+  for (const u of INDEX_LISTS[name]) {
+    try {
+      const res = await fetchNse(u);
+      if (res.ok) { csv = await res.text(); break; }
+      last = new Error('NSE returned HTTP ' + res.status + ' for ' + name + ' list');
+    } catch (e) { last = e; }
+  }
+  if (!csv) throw last || new Error('index list not available');
+  const syms = [];
+  csv.split(/\r?\n/).slice(1).forEach((line) => {
+    const p = line.split(',');
+    if (p.length >= 3) {
+      const s = p[p.length - 3].trim().replace(/"/g, '');
+      if (s && /^[A-Z0-9&\-]+$/.test(s)) syms.push(s);
+    }
+  });
+  if (syms.length < 30) throw new Error('index list looks wrong (' + syms.length + ' symbols)');
+  await sql(env, `create table if not exists index_members (index_name text not null, symbol text not null, primary key (index_name, symbol))`);
+  await sql(env, `delete from index_members where index_name = $1::text`, [name]);
+  const arr = '{' + syms.map((x) => '"' + x + '"').join(',') + '}';
+  await sql(env, `insert into index_members (index_name, symbol) select $1::text, x from unnest($2::text[]) as x on conflict do nothing`, [name, arr]);
+  return { index: name, symbols: syms.length };
 }
 
 async function logFailure(env, name, message) {
@@ -205,8 +250,10 @@ const ADMIN_HTML = String.raw`<!doctype html>
 <label class="lb">Admin key</label><input class="input" id="k" type="password">
 <label class="lb">From date</label><input class="input" id="f" type="date">
 <label class="lb">To date</label><input class="input" id="t" type="date">
-<button class="btn primary" id="go">Load price history</button>
+<button class="btn primary" id="go">Load price history (all stocks)</button>
+<button class="btn primary" id="old">Load older history: 5 years (NIFTY 500)</button>
 <button class="btn" id="names">Load company names</button>
+<button class="btn" id="idxb">Load index lists (NIFTY 50 / 500)</button>
 </div>
 <p id="st" class="muted" style="margin:14px 0 6px">Ready.</p>
 <div class="progress"><div id="pb"></div></div>
@@ -222,13 +269,13 @@ $('f').value=new Date(now.getTime()-365*86400000).toISOString().slice(0,10);
 try{var sk=localStorage.getItem('stockit_key');if(sk)$('k').value=sk}catch(e){}
 function log(m){var l=$('log');l.textContent+='\n'+m;l.scrollTop=l.scrollHeight}
 var running=false,wake=null;
-async function callDay(key,d){
+async function callDay(key,d,idx){
   var lastErr='';
   for(var a=1;a<=3;a++){
     try{
       var ctl=new AbortController();
       var tm=setTimeout(function(){ctl.abort()},60000);
-      var r=await fetch('/api/load?key='+encodeURIComponent(key)+'&date='+d+'&to='+d,{signal:ctl.signal});
+      var r=await fetch('/api/load?key='+encodeURIComponent(key)+'&date='+d+'&to='+d+(idx?'&index='+idx:''),{signal:ctl.signal});
       clearTimeout(tm);
       var j=await r.json();
       if(j.error){return {status:'fatal',message:j.error}}
@@ -239,7 +286,7 @@ async function callDay(key,d){
   }
   return {status:'error',message:lastErr};
 }
-$('go').onclick=async function(){
+async function run(idx){
   if(running)return; running=true;
   var key=$('k').value.trim(),cur=$('f').value,end=$('t').value;
   if(!key||!cur||!end){log('Key and both dates are needed');running=false;return}
@@ -249,7 +296,7 @@ $('go').onclick=async function(){
   var done=0,loaded=0,already=0,skipped=0,problems=[];
   while(cur<=end){
     if(isWeekend(cur)){cur=addDays(cur,1);continue}
-    var x=await callDay(key,cur);
+    var x=await callDay(key,cur,idx);
     if(x.status==='fatal'){log('Stopped at '+cur+': '+x.message);break}
     if(x.status==='loaded')loaded++;
     else if(x.status==='already_loaded')already++;
@@ -264,11 +311,24 @@ $('go').onclick=async function(){
   if(problems.length){log('Problem din gulo:\n'+problems.join('\n'))}
   try{if(wake)wake.release()}catch(e){}
   running=false;
+}
+$('go').onclick=function(){run('')};
+$('old').onclick=function(){
+  $('f').value=new Date(now.getTime()-1826*86400000).toISOString().slice(0,10);
+  $('t').value=new Date(now.getTime()-366*86400000).toISOString().slice(0,10);
+  log('Older history: '+$('f').value+' to '+$('t').value+' (NIFTY 500 only)');
+  run('nifty500');
 };
 $('names').onclick=async function(){
   var key=$('k').value.trim();
   if(!key){log('Admin key needed');return}
   try{var r=await fetch('/api/load-names?key='+encodeURIComponent(key));log(await r.text())}
+  catch(e){log('Network error: '+e.message)}
+};
+$('idxb').onclick=async function(){
+  var key=$('k').value.trim();
+  if(!key){log('Admin key needed');return}
+  try{var r=await fetch('/api/load-index?key='+encodeURIComponent(key));log(await r.text())}
   catch(e){log('Network error: '+e.message)}
 };
 </script></div></body></html>`;
@@ -332,26 +392,46 @@ export default {
         }
 
         case '/api/market': {
-          // Top gainers / losers / most active on the latest loaded day (real data only)
+          // Gainers / losers / most active inside NIFTY 50 or NIFTY 500, latest loaded day (real data only)
+          const idx = (q.get('index') || 'nifty50').toLowerCase();
+          if (!INDEX_LISTS[idx]) return json({ error: 'unknown index' }, 400);
           const base = `from price_daily p join instruments i on i.id = p.instrument_id
+            join index_members m on m.symbol = i.symbol and m.index_name = $1::text
             where p.trade_date = (select max(trade_date) from price_daily)
-              and i.series = 'EQ' and p.prev_close > 0 and p.close is not null
-              and p.turnover >= 10000000`;
+              and p.prev_close > 0 and p.close is not null`;
           const cols = `select i.symbol, i.name, p.close::float8 as close, p.prev_close::float8 as prev_close,
             ((p.close - p.prev_close) / p.prev_close * 100)::float8 as pct,
             p.volume::float8 as volume, (p.turnover / 10000000)::float8 as turnover_cr,
             p.trade_date::text as date`;
-          const [g, l, a] = await Promise.all([
-            sql(env, `${cols} ${base} order by pct desc limit 10`),
-            sql(env, `${cols} ${base} order by pct asc limit 10`),
-            sql(env, `${cols} ${base} order by p.turnover desc limit 10`),
-          ]);
+          let g, l, a;
+          try {
+            [g, l, a] = await Promise.all([
+              sql(env, `${cols} ${base} order by pct desc limit 10`, [idx]),
+              sql(env, `${cols} ${base} order by pct asc limit 10`, [idx]),
+              sql(env, `${cols} ${base} order by p.turnover desc nulls last limit 10`, [idx]),
+            ]);
+          } catch (e) {
+            if (/index_members/.test(String(e.message))) {
+              return json({ date: null, index: idx, note: 'index list not loaded yet' });
+            }
+            throw e;
+          }
           const date = (a.rows[0] || g.rows[0] || {}).date || null;
           return json(
-            { date, data_status: 'End of Day', source: 'NSE Bhavcopy', gainers: g.rows, losers: l.rows, active: a.rows },
+            { date, index: idx, data_status: 'End of Day', source: 'NSE Bhavcopy', gainers: g.rows, losers: l.rows, active: a.rows },
             200,
             { 'Cache-Control': 'public, max-age=300' }
           );
+        }
+
+        case '/api/load-index': {
+          if (!isAdmin) return json({ error: 'forbidden' }, 403);
+          const out = [];
+          for (const name of Object.keys(INDEX_LISTS)) {
+            try { out.push(await loadIndex(env, name)); }
+            catch (e) { out.push({ index: name, error: String(e.message || e) }); }
+          }
+          return json({ results: out });
         }
 
         case '/admin':
@@ -367,7 +447,7 @@ export default {
           let d = from;
           for (let i = 0; i < 5 && d <= to; i++) {
             try {
-              results.push(await loadDay(env, d));
+              results.push(await loadDay(env, d, false, q.get('index') === 'nifty500'));
             } catch (e) {
               results.push({ date: d, status: 'error', message: String(e.message || e) });
             }
@@ -397,4 +477,3 @@ export default {
     );
   },
 };
-                
