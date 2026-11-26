@@ -27,12 +27,15 @@ function json(data, status = 200) {
 
 // ---------- Database (Neon HTTP SQL, no npm needed) ----------
 async function sql(env, query, params = []) {
-  const host = new URL(env.DATABASE_URL).hostname;
+  const dbUrl = String(env.DATABASE_URL || '').trim();
+  const m = dbUrl.match(/@([^\/:?]+)/);
+  if (!m) throw new Error('DATABASE_URL secret missing or wrong (length ' + dbUrl.length + ')');
+  const host = m[1];
   const res = await fetch(`https://${host}/sql`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Neon-Connection-String': env.DATABASE_URL,
+      'Neon-Connection-String': dbUrl,
     },
     body: JSON.stringify({ query, params }),
   });
