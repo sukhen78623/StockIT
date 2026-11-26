@@ -2,5 +2,5 @@
   "name": "stockit",
   "main": "src/index.js",
   "compatibility_date": "2026-11-01",
-  "triggers": { "crons": ["30 14 * * 1-5"] }
+  "triggers": { "crons": ["30 14 * * *"] }
 }
